@@ -1,4 +1,3 @@
-
 from models.gnn import *
 import torch
 import torch.nn as nn
@@ -40,25 +39,29 @@ class staticGNNDetector(object):
         
         for e in range(self.train_config['epochs']):
             self.model.train()
-            neg_edge_index = negative_sampling(
-                edge_index=self.graph.train_pos_edge_index,
-                num_nodes=self.graph.num_nodes,
-                num_neg_samples=self.graph.train_pos_edge_index.size(1)
+            train_pos = self.graph.train_pos_edge_index
+            train_neg = negative_sampling(
+                edge_index = train_pos,
+                num_nodes = self.graph.num_nodes,
+                num_neg_samples = train_pos.size(1)
             ).to(dtype=torch.int64)
             
             optimizer.zero_grad()  
-            z = self.model(self.graph.x, self.graph.train_pos_edge_index)  # Get node embeddings
-            logits = self.model.decode(z, self.graph.train_pos_edge_index, neg_edge_index)
-            labels = self.get_link_labels(self.graph.train_pos_edge_index, neg_edge_index)
-            loss = F.binary_cross_entropy_with_logits(logits, labels.cuda()) 
+            z = self.model(self.graph.x, self.graph.edge_index)  # Get node embeddings
+            pos_logits = self.model.decode(z, train_pos)
+            neg_logits = self.model.decode(z, train_neg)
+
+            pos_loss = F.binary_cross_entropy_with_logits(pos_logits, torch.zeros_like(pos_logits)) 
+            neg_loss = F.binary_cross_entropy_with_logits(neg_logits, torch.ones_like(neg_logits).cuda()) 
+            loss = pos_loss + neg_loss
             loss.backward()  
             optimizer.step()  
             
-            val_score = self.eval(self.model, self.graph, 'val')
+            val_score = self.eval(self.model, self.graph, self.graph.val_pos_edge_index, self.graph.val_neg_edge_index)
             if val_score[self.train_config['metric']] > self.best_score:
                 self.patience_knt = 0
                 self.best_score = val_score[self.train_config['metric']]
-                test_score = self.eval(self.model, self.graph, 'test')
+                test_score = self.eval(self.model, self.graph, self.graph.test_pos_edge_index, self.graph.test_neg_edge_index)
  
                 print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}'.format(
                     e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'],
@@ -70,27 +73,25 @@ class staticGNNDetector(object):
         return test_score
 
     @torch.no_grad()
-    def eval(self, model, graph, prefix):
+    def eval(self, model, graph, eval_pos, eval_neg):
         self.model.eval()
-        z = model(graph.x, graph.train_pos_edge_index)  # Get node embeddings
+        z = model(graph.x, graph.edge_index)  # Get node embeddings
         
         result = {}
-        pos_edge_index = graph[f'{prefix}_pos_edge_index']
-        if prefix =='val':
-            neg_edge_index = graph[f'valid_neg_edge_index']
-        else:
-            neg_edge_index = graph[f'test_neg_edge_index']
-        link_logits = model.decode(z, pos_edge_index, neg_edge_index)
-        link_probs = link_logits.sigmoid()
-        link_labels = self.get_link_labels(pos_edge_index, neg_edge_index)
-        link_preds = (link_probs > 0.5).float()
+        pos_logits = model.decode(z, eval_pos)
+        neg_logits = model.decode(z, eval_neg)
         
-        k = int(link_labels.sum().item())
-        top_k_preds = link_probs.cpu().argsort(descending=True)[:k] 
-        rec = link_labels.cpu()[top_k_preds].sum().float() / k 
-        auc = roc_auc_score(link_labels.cpu(),link_probs.cpu())
-        prc = average_precision_score(link_labels.cpu(),link_probs.cpu())
-        f1 = f1_score(link_labels.cpu().numpy(), link_preds.cpu().numpy(), average='binary')
+        y_true = torch.cat([torch.zeros(pos_logits.size(0)), torch.ones(neg_logits.size(0))], dim=0)
+        y_pred = torch.cat([torch.sigmoid(pos_logits), torch.sigmoid(neg_logits)], dim=0)  # 在这里使用Sigmoid
+        y_pred_labels = (y_pred > 0.5).float()
+        
+        k = int(y_true.sum().item())
+        top_k_preds = y_pred.cpu().argsort(descending=True)[:k] 
+        
+        rec = y_true.cpu()[top_k_preds].sum().float() / k 
+        auc = roc_auc_score(y_true.cpu(), y_pred.cpu())
+        prc = average_precision_score(y_true.cpu(), y_pred.cpu())
+        f1 = f1_score(y_true.cpu().numpy(), y_pred_labels.cpu().numpy(), average='binary')
         
         result['AUROC'] = auc
         result['AUPRC'] = prc
@@ -99,11 +100,6 @@ class staticGNNDetector(object):
          
         return result
 
-class BaseDetector(object):
-    def __init__(self, train_config, model_config, train_set, valid_set, test_set):
-        super().__init__()       
-        self.model_config = model_config
-        self.train_config = train_config
                       
 class SnapshotDetector(object):
     def __init__(self, train_config, model_config, train_snapshots, valid_snapshots, test_snapshots):
@@ -112,13 +108,13 @@ class SnapshotDetector(object):
         self.train_config = train_config
         self.train_snapshots = [snapshot.to(train_config['device']) for snapshot in train_snapshots]
         if not isinstance(valid_snapshots, list):
-            self.valid_snapshot = valid_snapshots.to(train_config['device'])
+            self.valid_snapshots = valid_snapshots.to(train_config['device'])
         else:
-            self.valid_snapshot = [snapshot.to(train_config['device']) for snapshot in valid_snapshots]
+            self.valid_snapshots = [snapshot.to(train_config['device']) for snapshot in valid_snapshots]
         if not isinstance(test_snapshots, list):    
-            self.test_snapshot = test_snapshots.to(train_config['device'])
+            self.test_snapshots = test_snapshots.to(train_config['device'])
         else:
-            self.test_snapshot = [snapshot.to(train_config['device']) for snapshot in test_snapshots]
+            self.test_snapshots = [snapshot.to(train_config['device']) for snapshot in test_snapshots]
         self.best_score = -1
         self.patience_knt = 0
         
@@ -127,7 +123,6 @@ class SnapshotDetector(object):
         model_config['num_nodes'] = self.train_snapshots[0].x.shape[0]
         self.model = gnn(**model_config).to(train_config['device'])
         self.device = train_config['device']
-        # self.model = nn.DataParallel(self.model)
     
     def get_link_labels(self, pos_edge_index, neg_edge_index):
         num_links = pos_edge_index.size(1) + neg_edge_index.size(1)
@@ -145,23 +140,22 @@ class SnapshotDetector(object):
             self.model.train()
             z_list = self.model(self.train_snapshots)
             for i, data in enumerate(self.train_snapshots):
-                pos_edge_index = data.edge_index  # Positive and negative edges
-                neg_edge_index = negative_sampling(
-                    edge_index=pos_edge_index,
+                train_pos = data.edge_index  # Positive and negative edges
+                train_neg = negative_sampling(
+                    edge_index = train_pos,
                     num_nodes=data.num_nodes,
-                    num_neg_samples=pos_edge_index.size(1)
+                    num_neg_samples = train_pos.size(1)
                 ).to(dtype=torch.int64, device=self.device)
 
-
-                logits = self.model.decode(z_list[i].squeeze(0), pos_edge_index, neg_edge_index)
-                labels = self.get_link_labels(pos_edge_index, neg_edge_index)
-                pos_score = logits[:pos_edge_index.size(1)]
-                neg_score = logits[pos_edge_index.size(1):]
-                
+                z = z_list[i]   # Get node embeddings
+                pos_logits = self.model.decode(z, train_pos)
+                neg_logits = self.model.decode(z, train_neg)
                 if self.train_config['loss'] == 'pairwise':
-                    loss += self.pairwise_loss(pos_score, neg_score)   
+                    loss += self.pairwise_loss(torch.sigmoid(pos_logits), torch.sigmoid(neg_logits))   
                 else:    
-                    loss += F.binary_cross_entropy(logits, labels.cuda())   
+                    pos_loss = F.binary_cross_entropy_with_logits(pos_logits, torch.zeros_like(pos_logits)) 
+                    neg_loss = F.binary_cross_entropy_with_logits(neg_logits, torch.ones_like(neg_logits).cuda()) 
+                    loss += pos_loss + neg_loss 
                    
             loss = loss / len(self.train_snapshots)           
             loss.backward()
@@ -169,11 +163,11 @@ class SnapshotDetector(object):
             optimizer.zero_grad()  
                 
             self.model.eval()
-            val_score = self.eval(self.model, self.valid_snapshot)
+            val_score = self.eval(self.model, self.valid_snapshots)
             if val_score[self.train_config['metric']] > self.best_score:
                 self.patience_knt = 0
                 self.best_score = val_score[self.train_config['metric']]
-                test_score = self.eval(self.model, self.test_snapshot)
+                test_score = self.eval(self.model, self.test_snapshots)
 
                 print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}'.format(
                     e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'],
@@ -186,36 +180,41 @@ class SnapshotDetector(object):
         return test_score  
     
     @torch.no_grad()
-    def eval(self, model, graph):
+    def eval(self, model, snapshots):
         rec, auc, prc, f1 = 0, 0, 0, 0
-        z = model(graph)
-        for i, data in enumerate(graph):
+        z = model(snapshots)
+        for i, data in enumerate(snapshots):
             result = {}
+            z = z[i]
             pos_mask = data.y == 0
             neg_mask = data.y == 1
 
-            pos_edge_index = data.edge_index[:, pos_mask]
-            neg_edge_index = data.edge_index[:, neg_mask]
+            eval_pos = data.edge_index[:, pos_mask]
+            eval_neg = data.edge_index[:, neg_mask]
+
+            pos_logits = model.decode(z, eval_pos)
+            neg_logits = model.decode(z, eval_neg)
             
-            link_probs = model.decode(z[i].squeeze(0), pos_edge_index, neg_edge_index)
-            link_probs = link_probs.cpu() 
-            link_labels = self.get_link_labels(pos_edge_index, neg_edge_index)
-            link_labels = link_labels.cpu()
-            link_preds = (link_probs > 0.5).int()
-            
+            y_true = torch.cat([torch.zeros(pos_logits.size(0)), torch.ones(neg_logits.size(0))], dim=0)
+            # y_true = self.get_link_labels(eval_pos, eval_neg)
+            y_pred = torch.cat([torch.sigmoid(pos_logits), torch.sigmoid(neg_logits)], dim=0)
+            y_true = y_true.cpu()
+            y_pred = y_pred.cpu()
+            y_pred_labels = (y_pred > 0.5).float()
+
             k = 50
-            sorted_indices = np.argsort(link_probs.numpy())[::-1] 
+            sorted_indices = np.argsort(y_pred.numpy())[::-1] 
             top_k_indices = sorted_indices[:k]
             
-            rec += np.sum(link_labels.numpy()[top_k_indices]) / np.sum(link_labels.numpy()) if np.sum(link_labels.numpy()) != 0 else 0
-            auc += roc_auc_score(link_labels.numpy(), link_probs.numpy())
-            prc += average_precision_score(link_labels.numpy(), link_probs.numpy())
-            f1 += f1_score(link_labels.numpy(), link_preds.numpy(), average='binary')
+            rec += np.sum(y_true.numpy()[top_k_indices]) / np.sum(y_true.numpy()) if np.sum(y_true.numpy()) != 0 else 0
+            auc += roc_auc_score(y_true.numpy(), y_pred.numpy())
+            prc += average_precision_score(y_true.numpy(), y_pred.numpy())
+            f1 += f1_score(y_true.numpy(), y_pred_labels.numpy(), average='binary')
         
-        result['AUROC'] = auc/len(graph)
-        result['AUPRC'] = prc/len(graph)
-        result['RecK'] = rec/len(graph)
-        result['F1'] = f1/len(graph)
+        result['AUROC'] = auc/len(snapshots)
+        result['AUPRC'] = prc/len(snapshots)
+        result['RecK'] = rec/len(snapshots)
+        result['F1'] = f1/len(snapshots)
             
         return result     
 
@@ -338,20 +337,20 @@ class SnapshotsDetector(object):
 
 
 
-class DTTGDetector(object):
+class DTDGDetector(object):
     def __init__(self, train_config, model_config, train_snapshots, valid_snapshots, test_snapshots):
         super().__init__()
         self.model_config = model_config
         self.train_config = train_config
         self.train_snapshots = [snapshot.to(train_config['device']) for snapshot in train_snapshots]
         if not isinstance(valid_snapshots, list):
-            self.valid_snapshot = valid_snapshots.to(train_config['device'])
+            self.valid_snapshots = valid_snapshots.to(train_config['device'])
         else:
-            self.valid_snapshot = [snapshot.to(train_config['device']) for snapshot in valid_snapshots]
+            self.valid_snapshots = [snapshot.to(train_config['device']) for snapshot in valid_snapshots]
         if not isinstance(test_snapshots, list):    
-            self.test_snapshot = test_snapshots.to(train_config['device'])
+            self.test_snapshots = test_snapshots.to(train_config['device'])
         else:
-            self.test_snapshot = [snapshot.to(train_config['device']) for snapshot in test_snapshots]
+            self.test_snapshots = [snapshot.to(train_config['device']) for snapshot in test_snapshots]
         self.best_score = -1
         self.patience_knt = 0
         
@@ -377,23 +376,23 @@ class DTTGDetector(object):
 
             self.model.train()
             for i, data in enumerate(self.train_snapshots):
-                pos_edge_index = data.edge_index  # Positive and negative edges
-                neg_edge_index = negative_sampling(
-                    edge_index = data.edge_index,
+                train_pos = data.edge_index  # Positive and negative edges
+                train_neg = negative_sampling(
+                    edge_index = train_pos,
                     num_nodes = data.num_nodes,
-                    num_neg_samples = pos_edge_index.size(1)
+                    num_neg_samples = train_pos.size(1)
                 ).to(dtype=torch.int64)
     
-                z = self.model(data.x, pos_edge_index)
-                logits = self.model.decode(z, pos_edge_index, neg_edge_index)
-                labels = self.get_link_labels(pos_edge_index, neg_edge_index)
-                pos_score = logits[:pos_edge_index.size(1)]
-                neg_score = logits[pos_edge_index.size(1):]
-                
+                z = self.model(data.x, data.edge_index)
+                pos_logits = self.model.decode(z, train_pos)
+                neg_logits = self.model.decode(z, train_neg)
                 if self.train_config['loss'] == 'pairwise':
-                    loss += self.pairwise_loss(pos_score, neg_score)   
+                    loss += self.pairwise_loss(torch.sigmoid(pos_logits), torch.sigmoid(neg_logits))   
                 else:    
-                    loss += F.binary_cross_entropy(logits, labels.cuda())   
+                    pos_loss = F.binary_cross_entropy_with_logits(pos_logits, torch.zeros_like(pos_logits)) 
+                    neg_loss = F.binary_cross_entropy_with_logits(neg_logits, torch.ones_like(neg_logits)) 
+                    loss = pos_loss + neg_loss  
+                    loss += loss 
                    
             loss = loss / len(self.train_snapshots)           
             loss.backward()
@@ -401,11 +400,11 @@ class DTTGDetector(object):
             optimizer.zero_grad()  
                 
             self.model.eval()
-            val_score, _ ,_,_= self.eval(self.model, self.valid_snapshot)
+            val_score = self.eval(self.model, self.valid_snapshots)
             if val_score[self.train_config['metric']] > self.best_score:
                 self.patience_knt = 0
                 self.best_score = val_score[self.train_config['metric']]
-                test_score, z, neg_probs, pos_probs = self.eval(self.model, self.test_snapshot)
+                test_score = self.eval(self.model, self.test_snapshots)
 
                 print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}'.format(
                     e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'],
@@ -419,222 +418,41 @@ class DTTGDetector(object):
     
     @torch.no_grad()
     def eval(self, model, graph):
-        if not isinstance(graph, list):
-            z = model(graph.x, graph.edge_index)
+        rec, auc, prc, f1 = 0, 0, 0, 0
+        for i, data in enumerate(graph):
+            z = model(data.x, data.edge_index)
             result = {}
-            pos_mask = graph.y == 0
-            neg_mask = graph.y == 1
+            pos_mask = data.y == 0
+            neg_mask = data.y == 1
 
-            pos_edge_index = graph.edge_index[:, pos_mask]
-            neg_edge_index = graph.edge_index[:, neg_mask]
+            eval_pos = data.edge_index[:, pos_mask]
+            eval_neg = data.edge_index[:, neg_mask]
+
+            pos_logits = model.decode(z, eval_pos)
+            neg_logits = model.decode(z, eval_neg)
             
-            link_probs = model.decode(z, pos_edge_index, neg_edge_index)
-            link_probs = link_probs.cpu() 
-            link_labels = self.get_link_labels(pos_edge_index, neg_edge_index)
-            link_labels = link_labels.cpu()
-            link_preds = (link_probs > 0.5).int()
-            
-            # Calculate Rec@k for each k in k_values
+            y_true = torch.cat([torch.zeros(pos_logits.size(0)), torch.ones(neg_logits.size(0))], dim=0)
+            # y_true = self.get_link_labels(eval_pos, eval_neg)
+            y_pred = torch.cat([torch.sigmoid(pos_logits), torch.sigmoid(neg_logits)], dim=0)
+            y_true = y_true.cpu()
+            y_pred = y_pred.cpu()
+            y_pred_labels = (y_pred > 0.5).float()
+
             k = 50
-            sorted_indices = np.argsort(link_probs.numpy())[::-1] 
+            sorted_indices = np.argsort(y_pred.numpy())[::-1] 
             top_k_indices = sorted_indices[:k]
             
-            rec = np.sum(link_labels.numpy()[top_k_indices]) / np.sum(link_labels.numpy()) if np.sum(link_labels.numpy()) != 0 else 0
-            auc = roc_auc_score(link_labels.numpy(), link_probs.numpy())
-            prc = average_precision_score(link_labels.numpy(), link_probs.numpy())
-            f1 = f1_score(link_labels.numpy(), link_preds.numpy(), average='binary')
-            
-            result['AUROC'] = auc
-            result['AUPRC'] = prc
-            result['RecK'] = rec
-            result['F1'] = f1
-            
-        else:
-            rec, auc, prc, f1 = 0, 0, 0, 0
-            for i, data in enumerate(graph):
-                z = model(data.x, data.edge_index)
-                result = {}
-                pos_mask = data.y == 0
-                neg_mask = data.y == 1
-
-                pos_edge_index = data.edge_index[:, pos_mask]
-                neg_edge_index = data.edge_index[:, neg_mask]
-                
-                link_probs = model.decode(z, pos_edge_index, neg_edge_index)
-                pos_probs = link_probs[:pos_edge_index.size(1)]
-                neg_probs = link_probs[pos_edge_index.size(1):]
-                link_probs = link_probs.cpu() 
-                link_labels = self.get_link_labels(pos_edge_index, neg_edge_index)
-                link_labels = link_labels.cpu()
-                link_preds = (link_probs > 0.5).int()
-                
-                k = 50
-                sorted_indices = np.argsort(link_probs.numpy())[::-1] 
-                top_k_indices = sorted_indices[:k]
-                
-                rec += np.sum(link_labels.numpy()[top_k_indices]) / np.sum(link_labels.numpy()) if np.sum(link_labels.numpy()) != 0 else 0
-                auc += roc_auc_score(link_labels.numpy(), link_probs.numpy())
-                prc += average_precision_score(link_labels.numpy(), link_probs.numpy())
-                f1 += f1_score(link_labels.numpy(), link_preds.numpy(), average='binary')
-            
-            result['AUROC'] = auc/len(graph)
-            result['AUPRC'] = prc/len(graph)
-            result['RecK'] = rec/len(graph)
-            result['F1'] = f1/len(graph)
-            
-        return result, z, neg_probs, pos_probs
-
-class DTTGDetector2(object):
-    def __init__(self, train_config, model_config, train_snapshots, valid_snapshot, test_snapshot):
-        super().__init__()
-        self.model_config = model_config
-        self.train_config = train_config
-        self.train_snapshots = [snapshot.to(train_config['device']) for snapshot in train_snapshots]
-        if not isinstance(valid_snapshot, list):
-            self.valid_snapshot = valid_snapshot.to(train_config['device'])
-        else:
-            self.valid_snapshot = [snapshot.to(train_config['device']) for snapshot in valid_snapshot]
-        if not isinstance(test_snapshot, list):    
-            self.test_snapshot = test_snapshot.to(train_config['device'])
-        else:
-            self.valid_snapshot = [snapshot.to(train_config['device']) for snapshot in valid_snapshot]
-
-        self.best_score = -1
-        self.patience_knt = 0
-        
-        gnn = globals()[model_config['model']]
-        model_config['input_dim'] = self.train_snapshots[0].x.shape[1]
-        model_config['num_nodes'] = self.train_snapshots[0].x.shape[0]
-        self.model = gnn(**model_config).to(train_config['device'])
-        self.scorer = EdgeScorer(hidden_dim=64).to(train_config['device'])
-        
-    def compute_anomalous_score(self, edge_index, z, scorer):
-        head_embs = z[edge_index[0]]  
-        tail_embs = z[edge_index[1]]  
-        edge_embs = head_embs * tail_embs  # Edge embedding as sum
-        scores = scorer(edge_embs)
-        return scores
-
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index,neg_edge_index], dim=-1) 
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1) 
-    
-    def get_link_labels(self, pos_edge_index, neg_edge_index):
-        num_links = pos_edge_index.size(1) + neg_edge_index.size(1)
-        link_labels = torch.zeros(num_links, dtype=torch.float)  
-        link_labels[pos_edge_index.size(1):] = 1
-        return link_labels
-        
-    def pairwise_loss(self, pos_score, neg_score, margin=0.6):
-        return F.relu(margin + pos_score - neg_score).mean()
-    
-    def train(self):
-        optimizer = torch.optim.Adam(list(self.model.parameters()) + list(self.scorer.parameters()), lr=self.model_config['lr'])
-
-        for e in range(self.train_config['epochs']):
-            self.model.train()
-            self.scorer.train() 
-            loss = 0
-            for i, data in enumerate(self.train_snapshots):
-                data.edge_type = torch.ones(data.edge_index.shape[1], dtype=torch.long)
-                optimizer.zero_grad()  
-                logits = self.model(data.x, data.edge_index)  # Get node embeddings
-                pos_edge_index = data.edge_index  # Positive and negative edges
-                neg_edge_index = negative_sampling(
-                    edge_index = data.edge_index,
-                    num_nodes = data.num_nodes,
-                    num_neg_samples = pos_edge_index.size(1)
-                ).to(dtype=torch.int64)
-                
-                pos_score = self.compute_anomalous_score(pos_edge_index, logits, self.scorer)  # Positive edge scores
-                neg_score = self.compute_anomalous_score(neg_edge_index, logits, self.scorer)  # Negative edge scores
-                
-                loss = self.pairwise_loss(pos_score, neg_score)           
-                
-            loss /= len(self.train_snapshots)                
-            loss.backward()  
-            optimizer.step()  
-            optimizer.zero_grad()    
-                
-            self.model.eval()
-            self.scorer.eval()
-            
-            val_score = self.eval(self.model, self.valid_snapshot)
-            if val_score[self.train_config['metric']] > self.best_score:
-                self.patience_knt = 0
-                self.best_score = val_score[self.train_config['metric']]
-                test_score = self.eval(self.model, self.test_snapshot)
-
-                print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}'.format(
-                    e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'],
-                    test_score['AUROC'], test_score['AUPRC'], test_score['RecK']))
-            else:
-                self.patience_knt += 1
-                if self.patience_knt > self.train_config['patience']:
-                    break 
-                
-        return test_score
-
-    @torch.no_grad()
-    def eval(self, model, graph):
-        rec, auc, prc, f1 = 0,0,0,0
-        for i, data in enumerate(graph):
-            z = self.model(data.x, data.edge_index)  # Get node embeddings
-            
-            result = {}
-            pos_mask = graph.y == 1
-            neg_mask = graph.y == 0
-
-            pos_edge_index = graph.edge_index[:, pos_mask]
-            neg_edge_index = graph.edge_index[:, neg_mask]
-            
-            link_logits = self.decode(z, pos_edge_index, neg_edge_index)
-            link_probs = link_logits.sigmoid()
-            link_labels = self.get_link_labels(pos_edge_index, neg_edge_index)
-            link_preds = (link_probs > 0.5).float()
-        
-            k = int(link_labels.sum().item())
-            top_k_preds = link_probs.cpu().argsort(descending=True)[:k] 
-            
-            rec += link_labels.cpu()[top_k_preds].sum().float() / k 
-            auc += roc_auc_score(link_labels.cpu(),link_probs.cpu())
-            prc += average_precision_score(link_labels.cpu(),link_probs.cpu())
-            f1 += f1_score(link_labels.cpu().numpy(), link_preds.cpu().numpy(), average='binary')
+            rec += np.sum(y_true.numpy()[top_k_indices]) / np.sum(y_true.numpy()) if np.sum(y_true.numpy()) != 0 else 0
+            auc += roc_auc_score(y_true.numpy(), y_pred.numpy())
+            prc += average_precision_score(y_true.numpy(), y_pred.numpy())
+            f1 += f1_score(y_true.numpy(), y_pred_labels.numpy(), average='binary')
         
         result['AUROC'] = auc/len(graph)
         result['AUPRC'] = prc/len(graph)
         result['RecK'] = rec/len(graph)
         result['F1'] = f1/len(graph)
-        
-        return result     
-                      
-    # def eval(self, model, snapshots):
-    #     result = {}     
-    #     y_true = []
-    #     y_pred = []
-
-    #     h,c = None, None
-    #     rec, auc, prc, f1 = 0,0,0,0
-    #     for i, data in enumerate(snapshots):
-    #         data.edge_type = torch.ones(data.edge_index.shape[1], dtype=torch.long)
-    #         logits, h, c = model(data.x, data.edge_index,data.edge_type, h, c)  
-    #         edge_index = data.edge_index
-    #         score = self.compute_anomalous_score(edge_index, logits, self.scorer)  
             
-    #         y_true.extend(data.y.cpu().numpy())
-    #         y_pred.extend(score.detach().cpu().numpy())
-    #         auc += roc_auc_score(y_true, y_pred)
-    #         prc += average_precision_score(y_true, y_pred)  
-
-    #     auc /= len(snapshots)
-    #     prc /= len(snapshots)
-        
-    #     result['AUROC'] = auc/len(snapshots)
-    #     result['AUPRC'] = prc/len(snapshots)
-    #     result['RecK'] = rec/len(snapshots)
-    #     result['F1'] = f1/len(snapshots)
-
-    #     return result  
+        return result
                               
 class CTTGDetector(object):
     def __init__(self, train_config, model_config):

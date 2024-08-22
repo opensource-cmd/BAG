@@ -21,9 +21,6 @@ from node2vec import Node2Vec
 from typing import Optional, Tuple
 import math
 
-import dgl
-import dgl.function as fn
-from dgl.utils import expand_as_pair
 from torch_scatter import scatter_add
 from copy import deepcopy
 from scipy.sparse.linalg import eigs, eigsh
@@ -193,7 +190,10 @@ class GCN(nn.Module):
             self.layers.append(GCNConv(hidden_dim, hidden_dim))
         self.act = getattr(nn, activation)()
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
-
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 1, bias=True),
+        ) 
+        
     def forward(self, x, edge_index):
         for i, layer in enumerate(self.layers):
             x = layer(x, edge_index)
@@ -202,10 +202,10 @@ class GCN(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index,neg_edge_index], dim=-1) 
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1) 
-
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits
 
 class GraphSAGE(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout_rate=0, 
@@ -217,7 +217,10 @@ class GraphSAGE(nn.Module):
             self.layers.append(SAGEConv(hidden_dim, hidden_dim))
         self.act = getattr(nn, activation)()
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
-
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 1, bias=True),
+        ) 
+        
     def forward(self, x, edge_index):
         for i, layer in enumerate(self.layers):
             x = layer(x, edge_index)
@@ -226,9 +229,10 @@ class GraphSAGE(nn.Module):
                 x = self.dropout(x)
         return x
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index,neg_edge_index], dim=-1) 
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1) 
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits
     
 
 class GIN(torch.nn.Module):
@@ -264,7 +268,9 @@ class GIN(torch.nn.Module):
                 nn.Linear(output_dim, output_dim)
             )
         ))
-
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 1, bias=True),
+        ) 
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
     def forward(self, x, edge_index):
@@ -275,9 +281,10 @@ class GIN(torch.nn.Module):
                 x = self.dropout(x)  
         return x
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index,neg_edge_index], dim=-1) 
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1) 
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits
     
 class GAT(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, heads=8, activation='ReLU', **kwargs):
@@ -289,7 +296,10 @@ class GAT(nn.Module):
         self.act = getattr(nn, activation)()
         self.gat2 = GATConv(hidden_dim*heads, hidden_dim, heads=heads,
                               concat=False, dropout=0.6)
-
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 1, bias=True),
+        ) 
+        
     def forward(self, x, edge_index):
         h = self.norm1(x)
         x = self.gat1(x, edge_index)
@@ -297,10 +307,11 @@ class GAT(nn.Module):
         x = self.act(x)
         x = self.gat2(x, edge_index)
         return x
-
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index,neg_edge_index], dim=-1) 
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1) 
+    
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits 
     
 class ChebNet(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, output_dim=64, num_layers=3, K=3, dropout_rate=0.5, **kwargs):
@@ -314,7 +325,10 @@ class ChebNet(nn.Module):
         
         self.dropout = nn.Dropout(dropout_rate)
         self.relu = nn.ReLU()
-
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 1, bias=True),
+        ) 
+        
     def forward(self, x, edge_index):
         for i, layer in enumerate(self.layers):
             x = layer(x, edge_index)
@@ -323,9 +337,10 @@ class ChebNet(nn.Module):
                 x = self.dropout(x)
         return x
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index,neg_edge_index], dim=-1) 
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)         
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits        
     
 class SGC(nn.Module):
     def __init__(self, input_dim, hidden_dim=128,  K=2, activation='ReLU', **kwargs):
@@ -333,16 +348,20 @@ class SGC(nn.Module):
         self.conv1 = SGConv(input_dim, hidden_dim, K=K, cached=True)
         self.act = getattr(nn, activation)()
         self.conv2 = SGConv(hidden_dim, hidden_dim, K=K, cached=True)
-
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 1, bias=True),
+        ) 
+        
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
         x = self.act(x)
         x = self.conv2(x, edge_index)
         return x
 
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index,neg_edge_index], dim=-1) 
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)     
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits   
     
 class GT(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, output_dim=128, num_layers=2, heads=4, dropout=0.1, **kwargs):
@@ -356,7 +375,10 @@ class GT(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         self.act = nn.ReLU()
-
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 1, bias=True),
+        ) 
+        
     def forward(self, x, edge_index):
 
         for layer in self.layers[:-1]:
@@ -366,7 +388,12 @@ class GT(nn.Module):
         
         x = self.layers[-1](x, edge_index)
         return x
-           
+    
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits
+              
 # Specialized GNNs
 
 class AddGraph(torch.nn.Module):
@@ -382,7 +409,6 @@ class AddGraph(torch.nn.Module):
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim, 1, bias=True),
-            nn.Sigmoid()
         ) 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -406,11 +432,10 @@ class AddGraph(torch.nn.Module):
 
         return h_list   
         
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze()   
+        logits = self.scorer(edge_embs)
+        return logits  
         
 class HCA(nn.Module):
     def __init__(self, hidden, dropout):
@@ -546,7 +571,6 @@ class Dy_GrEncoder(torch.nn.Module):
         self.recurrent = DyGrEncoder(hidden_dim, 1, 'mean', hidden_dim, 1)
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim, 1, bias=True),
-            nn.Sigmoid()
         ) 
 
     def forward(self, x, edge_index):
@@ -554,11 +578,10 @@ class Dy_GrEncoder(torch.nn.Module):
         h = F.relu(H_tilde)        
         return h
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze()     
+        logits = self.scorer(edge_embs)
+        return logits     
     
 class EvolveGCN_H(torch.nn.Module):    
     def __init__(self, input_dim: int, num_nodes:int, **kwargs):
@@ -567,7 +590,6 @@ class EvolveGCN_H(torch.nn.Module):
         self.linear = nn.Linear(input_dim, input_dim)
         self.scorer = nn.Sequential(
             nn.Linear(input_dim, 1, bias=True),
-            nn.Sigmoid()
         )   
              
     def forward(self, x, edge_index) -> torch.FloatTensor:
@@ -576,11 +598,10 @@ class EvolveGCN_H(torch.nn.Module):
         h = self.linear(h)
         return h
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze()    
+        logits = self.scorer(edge_embs)
+        return logits  
 
 class EvolveGCN_O(torch.nn.Module):
     def __init__(self, input_dim: int, **kwargs):
@@ -588,7 +609,6 @@ class EvolveGCN_O(torch.nn.Module):
         self.recurrent = EvolveGCNO(input_dim)
         self.scorer = nn.Sequential(
             nn.Linear(input_dim, 1, bias=True),
-            nn.Sigmoid()
         ) 
         
     def forward(self, x, edge_index) -> torch.FloatTensor:
@@ -596,11 +616,10 @@ class EvolveGCN_O(torch.nn.Module):
         # h = F.relu(h)
         return h
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze()    
+        logits = self.scorer(edge_embs)
+        return logits   
 
 
 class MPNN_LSTM(torch.nn.Module):    ## epoch 70后下降
@@ -613,7 +632,6 @@ class MPNN_LSTM(torch.nn.Module):    ## epoch 70后下降
         self.linear = torch.nn.Linear(self.hidden_dim*2 + self.input_dim, self.hidden_dim)
         self.scorer = nn.Sequential(
             nn.Linear(self.hidden_dim*2 + self.input_dim, 1, bias=True),
-            nn.Sigmoid()
         ) 
         
     def forward(self, x, edge_index, edge_weight=None) -> torch.FloatTensor:
@@ -622,11 +640,10 @@ class MPNN_LSTM(torch.nn.Module):    ## epoch 70后下降
         # h = self.linear(h)
         return h
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze()    
+        logits = self.scorer(edge_embs)
+        return logits  
 
 class T_GCN(torch.nn.Module): 
     def __init__(self, input_dim: int, hidden_dim=64, **kwargs):
@@ -635,7 +652,6 @@ class T_GCN(torch.nn.Module):
         self.recurrent2 = TGCN(hidden_dim, hidden_dim)
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim, 1, bias=True),
-            nn.Sigmoid()
         ) 
         
     def forward(self, x, edge_index) -> torch.FloatTensor:
@@ -644,11 +660,10 @@ class T_GCN(torch.nn.Module):
         h = self.recurrent2(h, edge_index)
         return h
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze()        
+        logits = self.scorer(edge_embs)
+        return logits        
     
     
 #### Still need to be optimized
@@ -1401,7 +1416,6 @@ class CD_GCN(torch.nn.Module):
         self.lstm = LSTM(hidden_dim, hidden_dim)
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim, 1, bias=True),
-            nn.Sigmoid()
         ) 
         self.act = getattr(nn, activation)()
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
@@ -1418,13 +1432,12 @@ class CD_GCN(torch.nn.Module):
         gcn_outputs = torch.cat(gcn_outputs, 0)
         lstm_out, _ = self.lstm(gcn_outputs)
         return lstm_out
-    
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
-        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze()  
 
+    def decode(self, z, edge_index):  
+        edge_embs = z[edge_index[0]] * z[edge_index[1]]  
+        logits = self.scorer(edge_embs)
+        return logits
+    
 class WD_GCN(nn.Module):
     def __init__(self, input_dim, num_nodes, hidden_dim=64, dropout_rate=0.5, activation='ReLU', **kwargs):
         super().__init__()
@@ -1434,7 +1447,6 @@ class WD_GCN(nn.Module):
         self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim, 1, bias=True),
-            nn.Sigmoid()
         ) 
         self.act = getattr(nn, activation)()
         self.dropout = nn.Dropout(dropout_rate)
@@ -1453,8 +1465,7 @@ class WD_GCN(nn.Module):
         gcn_out = self.dropout(gcn_out)
         return gcn_out  
 
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
-        score = self.scorer(edge_embs)
-        return score.squeeze() 
+        logits = self.scorer(edge_embs)
+        return logits

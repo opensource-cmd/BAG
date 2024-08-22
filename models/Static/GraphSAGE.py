@@ -22,8 +22,7 @@ class GraphSAGE(nn.Module):
                 x = self.dropout(x)
         return x
     
-    def decode(self, z, pos_edge_index, neg_edge_index): 
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1) 
+    def decode(self, z, edge_index):  
         edge_embs = z[edge_index[0]] * z[edge_index[1]]  
         logits = self.scorer(edge_embs)
-        return logits  
+        return logits
