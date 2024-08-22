@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Run Benchmark with Args",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/benchmark.py",
+            "console": "integratedTerminal",
+            "args": ["--trial", "1", "--datasets", "1", "--models", "9", "--anomaly_percent", "0.1"]
+        }
+    ]
+}
+
+
